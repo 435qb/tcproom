@@ -1,94 +1,59 @@
 #ifndef MESSAGE_HPP
 #define MESSAGE_HPP
 
+#include "utils.hpp"
+#include <array>
 #include <cstdint>
 #include <cstring>
-enum class MessageType{
-    SYNC
-};
-struct Message{
+enum class MessageType { SYNC };
+struct Message {
     using UserIDType = uint64_t;
     UserIDType userID;
-    
-
 };
 
-struct request {
+struct Request {
+
     enum class MessageType : uint32_t { LOGIN, SEND, LOGOUT } type;
-    uint32_t data_length;
-    const unsigned char *data; // not owner
-    constexpr static auto length_size = sizeof(uint32_t);
+    uint32_t data_length{};
+    const unsigned char *data{}; // not owner
 
-    static int parse(const unsigned char *buf, const unsigned char *end,
-                     request *request) {
-        if (next(&buf, end, &request->type) < 0) {
-            return -1;
-        }
-        if (next(&buf, end, &request->data_length) < 0) {
-            return -1;
-        }
-        if (buf + request->data_length > end) {
-            return -1;
-        }
-        if (buf + request->data_length < end) [[unlikely]] {
-            return 1;
-        }
-        request->data = buf;
-        return 0;
-    }
-    template <class T>
-    static int next(const unsigned char **buf, const unsigned char *end,
-                    T *retn) {
-        auto length = end - *buf;
-        if (sizeof(T) > length) {
-            return -1;
-        }
-        *retn = *reinterpret_cast<const T *>(*buf);
-        *buf += sizeof(T);
-        return 0;
-    }
+    constexpr static auto length_size = sizeof(data_length);
 
-    int deparse(unsigned char *buf, int length){
-        if(payload_length() > length){
-            return -1;
-        }
-        memcpy(buf, &type, length_size);
-        buf += length_size;
+    std::unique_ptr<unsigned char[]> raw{};
+    uint32_t raw_length{};
 
-        memcpy(buf, &data_length, length_size);
-        buf += length_size;
+    Request() = default;
+    int parse();
 
-        memcpy(buf, data, data_length);
-        return 0;
-    }
-
-    uint32_t payload_length(){
+    inline uint32_t payload_length() const {
         return length_size + length_size + data_length;
     }
-};
 
+    int send(int fd);
+
+    struct iovec *gen_iovecs() const;
+
+    void update_len() const { len = payload_length(); }
+
+  private:
+    void deparse(unsigned char *buf) const;
+    mutable uint32_t len;
+};
 
 struct PayloadParser {
-    uint32_t length;
-    enum class State{
-        Finished, Length, Payload
-    } state;
+    using length_type = uint32_t;
+    length_type length{};
+    constexpr static auto length_size = sizeof(length_type);
 
-    int parse(){
-        switch (state) {
-        case State::Finished:
+    constexpr static auto max_length = BUFFER_SIZE / 2;
+    enum class State { Finished, Length } state{State::Finished};
+    enum class Result { OK, Broken, NotCompleted };
 
-        case State::Length:
+    CycleBuffer buffer{length_size + max_length};
 
-        case State::Payload:
+    Result parseRequest(Request *request);
 
-            break;
-        }
-    }
-
-    int parseRequest();
-    int parseResponse();
+    size_t consume(const unsigned char *data, size_t length);
 };
-
 
 #endif // MESSAGE_HPP

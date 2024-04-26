@@ -4,8 +4,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <memory>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 constexpr auto PORTNOLEN = 10;
@@ -87,23 +90,74 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    request r;
-    auto name = "qbqqq";
-    r.type = request::MessageType::LOGIN;
-    r.data = reinterpret_cast<const unsigned char*>(name);
-    r.data_length = strlen(name);
-    unsigned char buffer[512];
-    auto buf = buffer;
-    uint32_t length = r.payload_length();
-    memcpy(buf, &length, request::length_size);
-    buf += request::length_size;
-    r.deparse(buf, length);
-    if(send(sockfd, buffer, length + request::length_size, 0) < 0){
-        fprintf(stderr, "send() failed: (%d) %s\n", errno, strerror(errno));
-        exit(1);
+    PayloadParser parser;
+
+    std::jthread recv_thread([&parser, sockfd]() {
+        while (true) {
+            Request recv_request;
+            auto retn = PayloadParser::Result::OK;
+            do {
+                unsigned char recv_buf[PayloadParser::max_length];
+                int recv_length =
+                    recv(sockfd, recv_buf, PayloadParser::max_length, 0);
+                if (recv_length < 0) {
+                    fprintf(stderr, "recv() failed: (%d) %s\n", errno,
+                            strerror(errno));
+                    exit(1);
+                }
+                parser.consume(recv_buf, recv_length);
+
+                retn = parser.parseRequest(&recv_request);
+            } while (retn == PayloadParser::Result::NotCompleted);
+
+            if (retn == PayloadParser::Result::Broken) {
+                fprintf(stderr, "payload broken\n");
+                exit(1);
+            }
+            switch (recv_request.type) {
+            case Request::MessageType::SEND:
+                std::cout.write((char *)recv_request.data,
+                                recv_request.data_length);
+                std::cout << "\n";
+                break;
+            case Request::MessageType::LOGIN:
+            case Request::MessageType::LOGOUT:
+            default:
+                fprintf(stderr, "request broken\n");
+                break;
+            }
+        }
+    });
+
+    std::string name;
+    {
+        std::cout << "name:";
+        std::cin >> name;
+        char blank;
+        std::cin.get(blank);
+        Request r;
+        r.type = Request::MessageType::LOGIN;
+        r.data = reinterpret_cast<const unsigned char *>(name.data());
+        r.data_length = name.size();
+
+        if (r.send(sockfd) < 0) {
+            fprintf(stderr, "writev() failed: (%d) %s\n", errno,
+                    strerror(errno));
+            exit(1);
+        }
     }
-    char bbb[21]{};
-    recv(sockfd, bbb, 20, 0);
-    bbb[20] = 0;
-    printf("%s", buf);
+
+    std::string curr_text;
+    while (std::getline(std::cin, curr_text)) {
+        Request r;
+        r.type = Request::MessageType::SEND;
+        r.data = reinterpret_cast<const unsigned char *>(curr_text.data());
+        r.data_length = curr_text.size();
+
+        if (r.send(sockfd) < 0) {
+            fprintf(stderr, "writev() failed: (%d) %s\n", errno,
+                    strerror(errno));
+            exit(1);
+        }
+    }
 }

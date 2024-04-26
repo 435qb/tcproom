@@ -1,10 +1,11 @@
 #ifndef UTILS_HPP
 #define UTILS_HPP
 
+#include <arpa/inet.h>
 #include <cstddef>
-#include <cstdint>
 #include <cstring>
 #include <memory>
+#include <netinet/in.h>
 #include <sys/socket.h>
 
 constexpr auto QD = 64;
@@ -14,35 +15,28 @@ constexpr auto CQES = (QD * 16);
 constexpr auto BUFFERS = CQES;
 constexpr auto BACKLOG = 8;
 
-class TCPSocket {
-  private:
-    int fd_;
-    TCPSocket(int fd) : fd_(fd) {}
 
-  public:
-    //! Default: construct an unbound, unconnected TCP socket
-    TCPSocket() : fd_(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) {}
-};
+
+void get_fd_info(int fd, sa_family_t af, const char* &name, int &port);
+
+void close_connection(int fdidx, sa_family_t af);
+
 struct CycleBuffer {
+    int start{};
     int end{};
     size_t length{};
     std::unique_ptr<unsigned char[]> data{};
 
     CycleBuffer() = default;
 
-    CycleBuffer(size_t length_)
-        : length(length_), data(std::make_unique<unsigned char[]>(length_)){};
+    CycleBuffer(size_t length_);
 
-    int consume(const unsigned char * buf, size_t buf_len){
-        if(buf_len + size() > length){
-            return -1;
-        }
-        memcpy(data.get() + size(), buf, buf_len);
-        return 0;
+    size_t consume(const unsigned char *buf, size_t buf_len);
+    inline size_t size() const {
+        return (end + length - start) % length;
     }
-    size_t size() const {
-        return end;
-    }
+
+    void extract_no_check(unsigned char *buf, size_t buf_len);
 };
 
 

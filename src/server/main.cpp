@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <cassert>
 #include <cstdint>
 #include <errno.h>
 #include <memory>
@@ -12,31 +13,39 @@
 #include <unordered_map>
 
 #include "liburing.h"
-#include "utils.hpp"
 #include "message.hpp"
-
-
-struct user_data {
-    int index;
-    int fd;
-};
+#include "utils.hpp"
 
 struct client_ctx {
-    std::unique_ptr<unsigned char[]> buf;
-    int curr_idx;
-    int length; // <0 means length is not completed like 123 | 4
+    PayloadParser parser;
     std::string name;
+};
 
-    // clear except name
-    void clear_state() {
-        buf = nullptr;
-        curr_idx = 0;
-        length = 0;
+struct shared_count {
+    size_t count;
+    const Request *request;
+    struct iovec *iovecs;
+    void release() {
+        assert(count);
+        --count;
+        if (count == 0) {
+            delete request;
+            delete iovecs;
+            delete this;
+        }
     }
 };
 
+struct user_data {
+    enum class Type { SEND, ACCEPT, RECV } type;
+    union {
+        int fd;
+        shared_count *count;
+    };
+};
+
 struct ctx {
-    struct io_uring ring{};
+    struct io_uring ring {};
     struct io_uring_buf_ring *buf_ring{};
     unsigned char *buffer_base{};
     // struct msghdr msg;
@@ -202,8 +211,10 @@ static int add_recv(struct ctx *ctx, int idx) {
 
     sqe->flags |= IOSQE_BUFFER_SELECT;
     sqe->buf_group = 0;
-    user_data ud{BUFFERS + 1, idx};
-    io_uring_sqe_set_data64(sqe, *(uint64_t *)&ud);
+    user_data *ud = new user_data{}; // {BUFFERS + 1, idx};
+    ud->type = user_data::Type::RECV;
+    ud->fd = idx;
+    io_uring_sqe_set_data64(sqe, (uint64_t)ud);
     return 0;
 }
 
@@ -216,8 +227,10 @@ int add_accept(ctx *ctx, int fdidx) {
     io_uring_prep_multishot_accept(sqe, fdidx, NULL, NULL, 0);
     sqe->flags |= IOSQE_FIXED_FILE;
 
-    user_data ud{BUFFERS + 2};
-    io_uring_sqe_set_data64(sqe, *(uint64_t *)&ud);
+    // user_data ud{BUFFERS + 2};
+    user_data *ud = new user_data{};
+    ud->type = user_data::Type::ACCEPT;
+    io_uring_sqe_set_data64(sqe, (uint64_t)ud);
     return 0;
 }
 
@@ -227,71 +240,71 @@ static void recycle_buffer(struct ctx *ctx, int idx) {
     io_uring_buf_ring_advance(ctx->buf_ring, 1);
 }
 
-int handle_request(struct ctx *ctx, request *r, int idx, int fdidx) {
+int add_send(struct ctx *ctx, int fdidx, shared_count *count) {
     struct io_uring_sqe *sqe;
     if (get_sqe(ctx, &sqe))
         return -1;
+    io_uring_prep_writev(sqe, fdidx, count->iovecs, 4, 0);
 
+    if (ctx->verbose) {
+        const char *name;
+        int port;
+        auto length = count->request->payload_length() + Request::length_size;
+        get_fd_info(fdidx, ctx->af, name, port);
+        fprintf(stderr, "send %lu bytes to [%s]:%d\n", length, name, port);
+    }
+    user_data *ud = new user_data{}; // {BUFFERS + 1, idx};
+    ud->type = user_data::Type::SEND;
+    ud->count = count;
+    io_uring_sqe_set_data64(sqe, (uint64_t)ud);
+    return 0;
+}
+int handle_request(struct ctx *ctx, const Request *r, int fdidx) {
     switch (r->type) {
-
-    case request::MessageType::LOGIN:
-
-    case request::MessageType::SEND:
+    case Request::MessageType::LOGIN:
+        ctx->links[fdidx].name = std::string((char *)r->data);
         break;
-    case request::MessageType::LOGOUT:
-
+    case Request::MessageType::SEND: {
+        auto size = ctx->links.size() - 1;
+        if (size == 0) {
+            break;
+        }
+        auto iovecs = r->gen_iovecs();
+        shared_count *count = new shared_count{size, r, iovecs};
+        for (auto &&[idx, _] : ctx->links) {
+            if (idx != fdidx) {
+                add_send(ctx, idx, count);
+            }
+        }
         break;
     }
-    char buffer[512] = "sad";
-    io_uring_prep_send(sqe, fdidx, buffer, 20, 0);
-    user_data ud{idx, fdidx};
-    io_uring_sqe_set_data64(sqe, *(uint64_t *)&ud);
-
+    case Request::MessageType::LOGOUT:
+        ctx->links.erase(fdidx);
+        close_connection(fdidx, ctx->af);
+        break;
+    }
     return 0;
 }
-static int process_cqe_send(struct ctx *ctx, struct io_uring_cqe *cqe) {
-    auto *ud = (user_data *)&cqe->user_data;
-    auto idx = ud->index;
+
+int process_cqe_send(struct ctx *ctx, struct io_uring_cqe *cqe) {
+    auto ud = ((user_data *)cqe->user_data)->count;
+    ud->release();
     if (cqe->res < 0)
         fprintf(stderr, "bad send %s\n", strerror(-cqe->res));
-    recycle_buffer(ctx, idx);
     return 0;
 }
 
-static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe) {
+int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe) {
     int ret, idx;
     struct io_uring_recvmsg_out *o;
-    auto *ud = (user_data *)&cqe->user_data;
+    auto *ud = (user_data *)cqe->user_data;
     auto fdidx = ud->fd;
     idx = cqe->flags >> 16;
 
-    if(cqe->res == 0){
-        ctx->links.erase(fdidx);
+    if (cqe->res == 0) {
         recycle_buffer(ctx, idx);
-        if (ctx->verbose) {
-            sockaddr_in6 addr6;
-            socklen_t socklength;
-            sockaddr_in *addr = (sockaddr_in *)&addr6;
-            
-            if (getpeername(fdidx, (sockaddr *)(&addr6), &socklength)) {
-                fprintf(stderr, "getpeername failed\n");
-            }
-            char buff[INET6_ADDRSTRLEN + 1];
-            const char *name;
-            void *paddr;
-
-            if (ctx->af == AF_INET6)
-                paddr = &addr6.sin6_addr;
-            else
-                paddr = &addr->sin_addr;
-
-            name = inet_ntop(ctx->af, paddr, buff, sizeof(buff));
-            if (!name)
-                name = "<INVALID>";
-            fprintf(stderr, "[%s]:%d disconnected\n\n", name,
-                    (int)ntohs(addr->sin_port));
-        }
-        close(fdidx);
+        ctx->links.erase(fdidx);
+        close_connection(fdidx, ctx->af);
         return 0;
     }
     if (!(cqe->flags & IORING_CQE_F_MORE)) {
@@ -304,122 +317,53 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe) {
         return 0;
 
     if (!(cqe->flags & IORING_CQE_F_BUFFER) || cqe->res < 0) {
-        fprintf(stderr, "recv cqe bad res %d\n", cqe->res);
+        fprintf(stderr, "bad recv %s\n", strerror(abs(cqe->res)));
         if (cqe->res == -EFAULT || cqe->res == -EINVAL)
             fprintf(stderr, "NB: This requires a kernel version >= 6.0\n");
         return -1;
     }
     // parse payload
 
-    ssize_t length = cqe->res;
+    size_t length = cqe->res; // cqe->res > 0
     auto buf = get_buffer(ctx, idx);
     auto &client_ctx = ctx->links[fdidx];
 
     if (ctx->verbose) {
-        sockaddr_in6 addr6;
-        socklen_t socklength = sizeof(sockaddr_in6);
-        sockaddr_in *addr = (sockaddr_in *)&addr6;
-        if (getpeername(fdidx, (sockaddr *)(&addr6), &socklength)) {
-            fprintf(stderr, "getpeername failed\n");
-        }
-        char buff[INET6_ADDRSTRLEN + 1];
         const char *name;
-        void *paddr;
-
-        if (ctx->af == AF_INET6)
-            paddr = &addr6.sin6_addr;
-        else
-            paddr = &addr->sin_addr;
-
-        name = inet_ntop(ctx->af, paddr, buff, sizeof(buff));
-        if (!name)
-            name = "<INVALID>";
-        fprintf(stderr, "received %ld bytes from [%s]:%d\n\n", length, name,
-                (int)ntohs(addr->sin_port));
+        int port;
+        get_fd_info(fdidx, ctx->af, name, port);
+        fprintf(stderr, "received %lu bytes from [%s]:%d\n\n", length, name,
+                port);
     }
 
-    if (client_ctx.buf) {
-        auto *const curr = client_ctx.buf.get();
-        if (client_ctx.length < 0) {
-            auto count = request::length_size - client_ctx.curr_idx;
-            memcpy(curr + client_ctx.curr_idx, buf, count);
-            buf += count;
-            length -= count;
-            client_ctx.length = *reinterpret_cast<uint32_t *>(curr);
-            client_ctx.curr_idx = request::length_size;
-        }
-        auto count = client_ctx.length - client_ctx.curr_idx;
-        memcpy(curr + client_ctx.curr_idx, buf, count);
-        buf += count;
-        length -= count;
-
-        if (client_ctx.length > BUFFER_SIZE) { // invalid
-            fprintf(stderr, "maxium data length\n");
-            recycle_buffer(ctx, idx);
-            client_ctx.clear_state();
-            return 0;
-        }
-
-        request r;
-        if (request::parse(curr + request::length_size, curr + length, &r) <
-            0) {
-            fprintf(stderr, "payload not completed\n");
-            recycle_buffer(ctx, idx);
-            client_ctx.clear_state();
-            return 0;
-        }
-
-        length -= r.payload_length();
-
-        if (handle_request(ctx, &r, idx, fdidx) < 0) {
-            return -1;
-        }
-        client_ctx.clear_state();
-    }
+    bool buf_in_use = true;
     while (true) {
-        if(length == 0){
+        if (length == 0) {
+            recycle_buffer(ctx, idx);
+            buf_in_use = false;
             break;
         }
-        if (length < request::length_size) {
-            client_ctx.buf = std::make_unique<unsigned char[]>(BUFFER_SIZE);
-            client_ctx.curr_idx = length;
-            client_ctx.length = -1;
-            memcpy(client_ctx.buf.get(), buf, length);
-            recycle_buffer(ctx, idx);
-            return 0;
-        }
-        auto curr_length = *reinterpret_cast<uint32_t *>(buf);
+        auto len = client_ctx.parser.consume(buf, length);
 
-        if (curr_length > BUFFER_SIZE) { // invalid
-            fprintf(stderr, "maxium data length\n");
-            recycle_buffer(ctx, idx);
-            return 0;
-        }
-        if (curr_length > length) {
-            client_ctx.buf = std::make_unique<unsigned char[]>(
-                curr_length + request::length_size);
-            client_ctx.length = curr_length;
-            client_ctx.curr_idx = length;
-            memcpy(client_ctx.buf.get(), buf, length);
-            recycle_buffer(ctx, idx);
-            return 0;
-        }
-        buf += request::length_size;
-        length -= request::length_size;
+        buf += len;
+        length -= len;
 
-        request r;
-        if (request::parse(buf, buf + length, &r) < 0) {
-            fprintf(stderr, "payload not completed\n");
-            recycle_buffer(ctx, idx);
-            client_ctx.clear_state();
+        Request *re = new Request;
+        auto ret = client_ctx.parser.parseRequest(re);
+        if (ret == PayloadParser::Result::Broken) {
+            if (buf_in_use) {
+                recycle_buffer(ctx, idx);
+            }
+            fprintf(stderr, "payload broken\n");
+            close_connection(fdidx, ctx->af);
             return 0;
+        } else if (ret == PayloadParser::Result::NotCompleted) {
+            if (ctx->verbose) {
+                fprintf(stderr, "payload not completed\n");
+            }
+            continue;
         }
-        length -= r.payload_length();
-
-        if (handle_request(ctx, &r, idx, fdidx) < 0) {
-            return -1;
-        }
-        client_ctx.clear_state();
+        handle_request(ctx, re, fdidx);
     }
     return 0;
 }
@@ -427,6 +371,7 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe) {
 int process_cqe_accept(struct ctx *ctx, struct io_uring_cqe *cqe) {
     int ret;
     if (!(cqe->flags & IORING_CQE_F_MORE)) {
+        delete (user_data *)cqe->user_data;
         ret = add_accept(ctx, 0);
         if (ret)
             return ret;
@@ -441,38 +386,33 @@ int process_cqe_accept(struct ctx *ctx, struct io_uring_cqe *cqe) {
         return 1;
 
     if (ctx->verbose) {
-        sockaddr_in6 addr6;
-        socklen_t socklength = sizeof(sockaddr_in6);
-        sockaddr_in *addr = (sockaddr_in *)&addr6;
-        if (getpeername(fdidx, (sockaddr *)(&addr6), &socklength)) {
-            fprintf(stderr, "getpeername failed\n");
-        }
-        char buff[INET6_ADDRSTRLEN + 1];
         const char *name;
-        void *paddr;
-
-        if (ctx->af == AF_INET6)
-            paddr = &addr6.sin6_addr;
-        else
-            paddr = &addr->sin_addr;
-
-        name = inet_ntop(ctx->af, paddr, buff, sizeof(buff));
-        if (!name)
-            name = "<INVALID>";
-        fprintf(stderr, "accepct connection from [%s]:%d\n", name,
-                (int)ntohs(addr->sin_port));
+        int port;
+        get_fd_info(fdidx, ctx->af, name, port);
+        fprintf(stderr, "accepct connection from [%s]:%d\n", name, port);
     }
     return 0;
 }
 
 static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe) {
-    user_data *ud = (user_data *)&cqe->user_data;
-    if (ud->index < BUFFERS)
-        return process_cqe_send(ctx, cqe);
-    else if (ud->index == BUFFERS + 1)
-        return process_cqe_recv(ctx, cqe);
-    else
-        return process_cqe_accept(ctx, cqe);
+    user_data *ud = (user_data *)cqe->user_data;
+    int retn;
+    switch (ud->type) {
+    case user_data::Type::SEND:
+        retn = process_cqe_send(ctx, cqe);
+        break;
+    case user_data::Type::ACCEPT:
+        retn = process_cqe_accept(ctx, cqe);
+        break;
+    case user_data::Type::RECV:
+        retn = process_cqe_recv(ctx, cqe);
+        break;
+    }
+    if (!(cqe->flags &
+          IORING_CQE_F_MORE)) { // F_MORE means another cqe owns this
+        delete ud;
+    }
+    return retn;
 }
 
 int main(int argc, char *argv[]) {
@@ -534,8 +474,6 @@ int main(int argc, char *argv[]) {
         count = io_uring_peek_batch_cqe(&ctx.ring, &cqes[0], CQES);
         for (i = 0; i < count; i++) {
             ret = process_cqe(&ctx, cqes[i]);
-            if (ret)
-                goto cleanup;
         }
         io_uring_cq_advance(&ctx.ring, count);
     }
